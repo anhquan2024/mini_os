@@ -219,24 +219,21 @@ int pg_getpage(struct mm_struct *mm, int pgn, int *fpn, struct pcb_t *caller)
 
       /* Retrieve the target frame number stored in swap from the page table
         * (assume the swap frame is encoded in the page table entry). */
-      int tgtfpn = PAGING_PTE_SWP(pte); // Macro: extract swap frame number
+      int tgtfpn = PAGING_SWP(pte); // Macro: extract swap frame number
 
       /* Now swap the target page from MEMSWP back into MEMRAM,
         * using the frame freed by the victim swap (vicpgn). */
       if (__mm_swap_page(caller, tgtfpn, vicpgn) != 0)
           return -1;
 
-      /* Update the page table entry to mark the page as present in MEMRAM.
-        * Clear the old frame bits and set the new frame (vicpgn) along with the present flag. */
-      mm->pgd[pgn] = (mm->pgd[pgn] & ~PAGING_FRAME_MASK) | vicpgn | PAGING_PRESENT;
+    /* Update the page table entry to mark the page as present in MEMRAM.
+    * Clear the old frame bits and set the new frame (vicpgn) along with the present flag. */
+    mm->pgd[pgn] = (mm->pgd[pgn] & ~PAGING_PTE_FPN_MASK) | vicpgn | PAGING_PTE_PRESENT_MASK;
+}
 
-      /* Enlist this page into the FIFO queue for future replacement decisions */
-      enlist_pgn_node(&caller->mm->fifo_pgn, pgn);
-  }
+*fpn = PAGING_FPN(mm->pgd[pgn]);
+return 0;
 
-  *fpn = PAGING_FPN(mm->pgd[pgn]);
-  return 0;
-  
 }
 
 /*pg_getval - read value at given offset
@@ -256,7 +253,7 @@ int pg_getval(struct mm_struct *mm, int addr, BYTE *data, struct pcb_t *caller)
     return -1; /* invalid page access */
 
   /* Calculate physical address using the frame number and offset */
-  int phyaddr = fpn * PAGING_PAGE_SIZE + off;
+  int phyaddr = fpn * PAGING_PAGESZ + off;
 
   /* Read from physical memory.
    * This simulates a SYSCALL 17 sys_memmap with SYSMEM_IO_READ.
@@ -285,12 +282,12 @@ int pg_setval(struct mm_struct *mm, int addr, BYTE value, struct pcb_t *caller)
       return -1;  /* invalid page access */
 
   /* Calculate physical address using the frame number and offset */
-  int phyaddr = fpn * PAGING_PAGE_SIZE + off;
+  int phyaddr = fpn * PAGING_PAGESZ + off;
 
   /* Write to physical memory.
-    * This simulates a SYSCALL 17 sys_memmap with SYSMEM_IO_WRITE.
-    * MEMPHY_write is expected to return 0 on success.
-    */
+   * This simulates a SYSCALL 17 sys_memmap with SYSMEM_IO_WRITE.
+   * MEMPHY_write is expected to return 0 on success.
+   */
   if (MEMPHY_write(caller->mram, phyaddr, value) != 0)
       return -1;
 
@@ -397,10 +394,10 @@ int free_pcb_memph(struct pcb_t *caller)
 
     if (!PAGING_PAGE_PRESENT(pte))
     {
-      fpn = PAGING_PTE_FPN(pte);
+      fpn = PAGING_FPN(pte);
       MEMPHY_put_freefp(caller->mram, fpn);
     } else {
-      fpn = PAGING_PTE_SWP(pte);
+      fpn = PAGING_SWP(pte);
       MEMPHY_put_freefp(caller->active_mswp, fpn);    
     }
   }
@@ -419,6 +416,11 @@ int find_victim_page(struct mm_struct *mm, int *retpgn)
   struct pgn_t *pg = mm->fifo_pgn;
 
   /* TODO: Implement the theorical mechanism to find the victim page */
+  if(pg == NULL)
+    return -1;
+  
+  *retpgn = pg->pgn;
+  mm->fifo_pgn = pg->pg_next; // Move to the next page in the FIFO list  
 
   free(pg);
 
@@ -444,9 +446,27 @@ int get_free_vmrg_area(struct pcb_t *caller, int vmaid, int size, struct vm_rg_s
   newrg->rg_start = newrg->rg_end = -1;
 
   /* TODO Traverse on list of free vm region to find a fit space */
-  //while (...)
-  // ..
-
+  struct vm_rg_struct *prev = NULL;
+  while (rgit != NULL) {
+    int avail = rgit->rg_end - rgit->rg_start;
+    if (avail >= size) {
+        newrg->rg_start = rgit->rg_start;
+        newrg->rg_end = newrg->rg_start + size;
+        // Adjust the free region in the list
+        rgit->rg_start = newrg->rg_end;
+        if (rgit->rg_start >= rgit->rg_end) {
+            if (prev == NULL)
+                cur_vma->vm_freerg_list = rgit->rg_next;
+            else
+                prev->rg_next = rgit->rg_next;
+            free(rgit);
+        }
+        return 0;
+    }
+    prev = rgit;
+    rgit = rgit->rg_next;
+  }
+  
   return 0;
 }
 

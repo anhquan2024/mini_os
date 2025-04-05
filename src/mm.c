@@ -85,21 +85,29 @@ int vmap_page_range(struct pcb_t *caller,           // process call
                     int pgnum,                      // num of mapping page
                     struct framephy_struct *frames, // list of the mapped frames
                     struct vm_rg_struct *ret_rg)    // return mapped region, the real mapped fp
-{                                                   // no guarantee all given pages are mapped
-  //struct framephy_struct *fpit;
+{                                                   
   int pgit = 0;
   int pgn = PAGING_PGN(addr);
 
-  /* TODO: update the rg_end and rg_start of ret_rg 
-  //ret_rg->rg_end =  ....
-  //ret_rg->rg_start = ...
-  //ret_rg->vmaid = ...
-  */
+  /* update the rg_end and rg_start of ret_rg */
+  ret_rg->rg_start = addr;
+  ret_rg->rg_end = addr + pgnum * PAGING_PAGESZ;
+  /* If needed, one might set a vm area id here if defined, e.g.:
+     ret_rg->vmaid = caller->some_vmaid; */
 
-  /* TODO map range of frame to address space
-   *      [addr to addr + pgnum*PAGING_PAGESZ
-   *      in page table caller->mm->pgd[]
+  /* map range of frame to address space:
+   * update the page table caller->mm->pgd[] for each page within the range.
+   * Here we assume that the frames list is a linked list where each node has field "fpn" and "fp_next".
    */
+  struct framephy_struct *cur_frame = frames;
+  int i;
+  for (i = 0; i < pgnum && cur_frame != NULL; i++) {
+      int cur_pgn = PAGING_PGN(addr + i * PAGING_PAGESZ);
+      /* Setting the page table entry:
+         we use pte_set_fpn to store the physical frame number along with the PRESENT flag */
+      pte_set_fpn(&caller->mm->pgd[cur_pgn], cur_frame->fpn);
+      cur_frame = cur_frame->fp_next;
+  }
 
   /* Tracking for later page replacement activities (if needed)
    * Enqueue new usage page */
@@ -112,37 +120,48 @@ int vmap_page_range(struct pcb_t *caller,           // process call
  * alloc_pages_range - allocate req_pgnum of frame in ram
  * @caller    : caller
  * @req_pgnum : request page num
- * @frm_lst   : frame list
+ * @frm_lst   : frame list (returned linked list)
  */
-
 int alloc_pages_range(struct pcb_t *caller, int req_pgnum, struct framephy_struct **frm_lst)
 {
   int pgit, fpn;
-  struct framephy_struct *newfp_str = NULL;
-
-  /* TODO: allocate the page 
-  //caller-> ...
-  //frm_lst-> ...
-  */
+  struct framephy_struct *head = NULL, *tail = NULL;
 
   for (pgit = 0; pgit < req_pgnum; pgit++)
   {
-  /* TODO: allocate the page 
-   */
-    if (MEMPHY_get_freefp(caller->mram, &fpn) == 0)
-    {
-      newfp_str->fpn = fpn;
-    }
-    else
-    { // TODO: ERROR CODE of obtaining somes but not enough frames
-    }
+      if (MEMPHY_get_freefp(caller->mram, &fpn) == 0)
+      {
+          struct framephy_struct *temp = malloc(sizeof(struct framephy_struct));
+          if (!temp)
+              return -1;  // allocation failure
+          temp->fpn = fpn;
+          temp->fp_next = NULL;
+          if (head == NULL)
+          {
+              head = temp;
+              tail = temp;
+          }
+          else
+          {
+              tail->fp_next = temp;
+              tail = temp;
+          }
+      }
+      else
+      { 
+          /* If we cannot obtain a free frame for any page, return error code.
+             In a full system, proper cleanup and swap mechanism would be applied.
+          */
+          return -3000; 
+      }
   }
 
-  return 0;
+  *frm_lst = head;
+  return req_pgnum;
 }
 
 /*
- * vm_map_ram - do the mapping all vm are to ram storage device
+ * vm_map_ram - do the mapping all vm area to ram storage device
  * @caller    : caller
  * @astart    : vm area start
  * @aend      : vm area end
@@ -155,13 +174,6 @@ int vm_map_ram(struct pcb_t *caller, int astart, int aend, int mapstart, int inc
   struct framephy_struct *frm_lst = NULL;
   int ret_alloc;
 
-  /*@bksysnet: author provides a feasible solution of getting frames
-   *FATAL logic in here, wrong behaviour if we have not enough page
-   *i.e. we request 1000 frames meanwhile our RAM has size of 3 frames
-   *Don't try to perform that case in this simple work, it will result
-   *in endless procedure of swap-off to get frame and we have not provide
-   *duplicate control mechanism, keep it simple
-   */
   ret_alloc = alloc_pages_range(caller, incpgnum, &frm_lst);
 
   if (ret_alloc < 0 && ret_alloc != -3000)
@@ -176,8 +188,7 @@ int vm_map_ram(struct pcb_t *caller, int astart, int aend, int mapstart, int inc
     return -1;
   }
 
-  /* it leaves the case of memory is enough but half in ram, half in swap
-   * do the swaping all to swapper to get the all in ram */
+  /* Map the pages: this will update the page table mapping for the range */
   vmap_page_range(caller, mapstart, incpgnum, frm_lst, ret_rg);
 
   return 0;
@@ -208,32 +219,34 @@ int __swap_cp_page(struct memphy_struct *mpsrc, int srcfpn,
 }
 
 /*
- *Initialize a empty Memory Management instance
+ * Initialize an empty Memory Management instance
  * @mm:     self mm
  * @caller: mm owner
  */
 int init_mm(struct mm_struct *mm, struct pcb_t *caller)
 {
   struct vm_area_struct *vma0 = malloc(sizeof(struct vm_area_struct));
-
+  if (!vma0)
+      return -1;
+  
   mm->pgd = malloc(PAGING_MAX_PGN * sizeof(uint32_t));
+  if (!mm->pgd)
+      return -1;
 
   /* By default the owner comes with at least one vma */
   vma0->vm_id = 0;
   vma0->vm_start = 0;
   vma0->vm_end = vma0->vm_start;
   vma0->sbrk = vma0->vm_start;
+  vma0->vm_next = NULL;  // TODO update VMA0 next: set to NULL
   struct vm_rg_struct *first_rg = init_vm_rg(vma0->vm_start, vma0->vm_end);
   enlist_vm_rg_node(&vma0->vm_freerg_list, first_rg);
-
-  /* TODO update VMA0 next */
-  // vma0->next = ...
 
   /* Point vma owner backward */
   vma0->vm_mm = mm; 
 
-  /* TODO: update mmap */
-  //mm->mmap = ...
+  /* update mmap: set the mm->mmap pointer to vma0 */
+  mm->mmap = vma0;
 
   return 0;
 }
